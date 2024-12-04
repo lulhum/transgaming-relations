@@ -3,6 +3,7 @@ import asyncio
 import os
 import datetime
 import matplotlib.pyplot as plt
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 from pathlib import Path
 from dotenv import load_dotenv
 from nlp import nlp
@@ -26,25 +27,26 @@ class MessageMap(object):
             self.task = asyncio.create_task(self.map())
         await self.task
         if self.filename is None:
-            self.filename = self.renderMap()
-            self.mmap = None
-        return self.filename
+            self.filename = asyncio.create_task(self.renderMap())
+        return await self.filename
 
-    def renderMap(self):
-        labels = [entry['member'].name for entry in self.mmap.values()]
+    async def renderMap(self):
+        labels = [entry['member'].display_name[:10] for entry in self.mmap.values()]
         data = [
             [0 if not len(m) else sum(m) / len(m) for m in entry['messages'].values()]
             for entry in self.mmap.values()
         ]
         fig = plt.figure()
+        plt.subplots_adjust(top=0.8, left=0.15)
         ax = fig.add_subplot(111)
         matrix = ax.matshow(data)
         fig.colorbar(matrix)
-        ax.set_xticklabels([''] + labels)
-        ax.set_yticklabels([''] + labels)
+        plt.xticks(range(len(labels)), labels, rotation='vertical')
+        plt.yticks(range(len(labels)), labels)
         Path('var/maps').mkdir(parents=True, exist_ok=True)
         filename = 'var/maps/{}.png'.format(datetime.datetime.now().isoformat())
         plt.savefig(filename)
+        self.mmap = None
         return filename
 
     def addToMap(self, author, target, score):
@@ -87,10 +89,15 @@ class MessageMap(object):
         if author not in self.members:
             return
         score = None
+        targets = set()
         async for target in self.getTargets(message, previous):
-            if target != author:
-                if score is None:
-                    score = self.scoreMessage(message)
+            if target == author:
+                continue
+            if target.id in targets:
+                continue
+            targets.add(target.id)
+            if score is None:
+                score = self.scoreMessage(message)
             self.addToMap(author, target, score)
             print('Message from {} to {} ({})'.format(author.name, target.name, score))
 
