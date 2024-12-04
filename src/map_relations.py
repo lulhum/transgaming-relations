@@ -2,55 +2,128 @@ import discord
 import asyncio
 import os
 import datetime
+import networkx as nx
 import matplotlib.pyplot as plt
-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+import matplotlib as mpl
 from pathlib import Path
 from dotenv import load_dotenv
 from nlp import nlp
+import math
+from enum import Enum
+from typing import Optional, Literal
+
+Colormap = Enum('Colormap', ((c, i) for i, c in enumerate(list(mpl.colormaps))))
 
 class MessageMap(object):
-    def __init__(self, role):
+    def __init__(self, role, since=7):
         self.createdAt = datetime.datetime.now()
-        self.since = self.createdAt - datetime.timedelta(days=30)
+        self.since = self.createdAt - datetime.timedelta(days=since)
         self.role = role
         self.members = set(role.members)
         self.guild = role.guild
         self.mmap = {m.id: {
             'member': m,
-            'messages': {m.id: [] for m in self.members}
+            'messages': {m.id: {'count': 0, 'sum': 0} for m in self.members}
         } for m in self.members}
         self.task = None
-        self.filename = None
+        self.files = {}
 
     async def resolve(self):
         if self.task is None:
             self.task = asyncio.create_task(self.map())
         await self.task
-        if self.filename is None:
-            self.filename = asyncio.create_task(self.renderMap())
-        return await self.filename
+        return self
 
-    async def renderMap(self):
+    async def getGraph(self, min_count):
+        filename = '{}.{}.graph.png'.format(self.createdAt.isoformat(), min_count)
+        if filename not in self.files:
+            self.files[filename] = asyncio.create_task(self.renderGraph(filename, min_count))
+        return await self.files[filename]
+
+    async def getMatrix(self, metric, cmap):
+        filename = '{}.{}.{}.matrix.png'.format(self.createdAt.isoformat(), cmap, metric)
+        if filename not in self.files:
+            self.files[filename] = asyncio.create_task(self.renderMatrix(filename, metric, cmap))
+        return await self.files[filename]
+
+    async def renderGraph(self, filename, min_count):
+        graph = nx.DiGraph()
+        mmax = 0
+        lmax = 0
+        for mid, entry in self.mmap.items():
+            label = entry['member'].display_name
+            weight = sum(m['count'] for m in entry['messages'].values())
+            if abs(weight) > mmax:
+                mmax = abs(weight)
+            graph.add_node(mid, label=label, weight=weight)
+            for tid, m in entry['messages'].items():
+                if m['count'] > min_count:
+                    if abs(m['sum']) > lmax:
+                        lmax = abs(m['sum'])
+                    graph.add_edge(mid, tid, count=m['count'], sum=m['sum'])
+        plt.figure(figsize=(len(self.mmap) * 2, len(self.mmap) * 2))
+        pos = nx.circular_layout(graph)
+        nx.draw_networkx_nodes(
+            graph,
+            pos,
+            cmap=Colormap.Wistia.name,
+            node_color=[node[1]['weight'] for node in graph.nodes(data=True)],
+            vmax=mmax,
+            vmin=0,
+            node_size=5000
+        )
+        nx.draw_networkx_edges(
+            graph,
+            pos,
+            connectionstyle=['arc3,rad=0.15', 'arc3,rad=0.30'],
+            edge_cmap=mpl.colormaps['seismic'],
+            edge_color=[edge[2]['sum'] for edge in graph.edges(data=True)],
+            node_size=5000,
+            edge_vmax=lmax,
+            edge_vmin=-lmax,
+            width=[math.log2(max(1, edge[2]['count'])) for edge in graph.edges(data=True)]
+        )
+        nx.draw_networkx_labels(
+            graph,
+            pos,
+            labels={node[0]: node[1]['label'][:10] for node in graph.nodes(data=True)}
+        )
+        Path('var/maps').mkdir(parents=True, exist_ok=True)        
+        filename = 'var/maps/{}'.format(filename)
+        plt.savefig(filename)
+        return filename  
+
+    async def renderMatrix(self, filename, metric, cmap):
         labels = [entry['member'].display_name[:10] for entry in self.mmap.values()]
         data = [
-            [0 if not len(m) else sum(m) / len(m) for m in entry['messages'].values()]
+            [m['sum'] / m['count'] if metric == 'mean' else m[metric] for m in entry['messages'].values()]
             for entry in self.mmap.values()
         ]
+        if metric == 'count':
+            if cmap is None:
+                cmap = Colormap.YlGnBu
+            vmax = max(max(row) for row in data)
+            vmin = 0
+        else:
+            if cmap is None:
+                cmap = Colormap.seismic
+            vmax = max(max(abs(d) for d in row) for row in data)
+            vmin = -vmax
         fig = plt.figure()
         plt.subplots_adjust(top=0.8, left=0.15)
         ax = fig.add_subplot(111)
-        matrix = ax.matshow(data)
+        matrix = ax.matshow(data, vmax=vmax, vmin=vmin, cmap=cmap.name)
         fig.colorbar(matrix)
         plt.xticks(range(len(labels)), labels, rotation='vertical')
         plt.yticks(range(len(labels)), labels)
         Path('var/maps').mkdir(parents=True, exist_ok=True)
-        filename = 'var/maps/{}.png'.format(datetime.datetime.now().isoformat())
+        filename = 'var/maps/{}'.format(filename)
         plt.savefig(filename)
-        self.mmap = None
         return filename
 
     def addToMap(self, author, target, score):
-        self.mmap[author.id]['messages'][target.id].append(score)
+        self.mmap[author.id]['messages'][target.id]['count'] += 1
+        self.mmap[author.id]['messages'][target.id]['sum'] += score
 
     async def getTargets(self, message, previous):
         if message.reference is not None:
@@ -125,20 +198,70 @@ intents.members = True
 intents.message_content = True
 
 client = MyClient(intents=intents)
+
 maps = {}
 
-@client.tree.command(name='map')
-@discord.app_commands.describe(role='The role to map')
-async def mapRole(interaction: discord.Interaction, role: discord.Role):
+async def getMap(role, since, clear_cache=False):
+    key = '{}@{}'.format(role, since)
+    if key not in maps or clear_cache:
+        maps[key] = MessageMap(role, since)
+    return await maps[key].resolve()
+
+def isMapCached(role, since):
+    return '{}@{}'.format(role, since) in maps
+
+
+@client.tree.command(name='matrix')
+@discord.app_commands.describe(role='Le rôle cartographié',
+                               since='Nombre de jour maximum à remonter dans l\'historique',
+                               metric='Valeur à mesurer',
+                               cmap='Échelle de couleurs')
+async def matrix(interaction: discord.Interaction,
+                 role: discord.Role,
+                 since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
+                 metric: Optional[Literal['sum', 'count', 'mean']] = 'sum',
+                 cmap: Optional[str] = None):
+    if cmap is not None:
+        if cmap not in (c.name for c in Colormap):
+            await interaction.response.send_message('Échelle de couleurs inconnue: {}. Voir https://matplotlib.org/stable/users/explain/colors/colormaps.html'.format(cmap))
+            return
+        cmap = Colormap[cmap]
     await interaction.response.send_message(
-        'Mapping du role {} en cours...'.format(role.name)
+        'Génération de la matrice {} du role {}'.format(metric, role.name)
     )
-    if role.id not in maps:
-        maps[role.id] = MessageMap(role)
-    if maps[role.id].createdAt < datetime.datetime.now() - datetime.timedelta(days=7):
-        maps[role.id] = MessageMap(role)
-    filename = await maps[role.id].resolve()
+    messageMap = await getMap(role, since)
+    filename = await messageMap.getMatrix(metric, cmap)
+    await interaction.channel.send(file=discord.File(filename))
+@client.tree.command(name='graph')
+@discord.app_commands.describe(role='Le rôle cartographié',
+                               since='Nombre de jour maximum à remonter dans l\'historique',
+                               min_count='Nombre minimal de messages pour afficher le lien')
+async def graph(interaction: discord.Interaction,
+                 role: discord.Role,
+                 since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
+                 min_count: Optional[int] = 10):
+    await interaction.response.send_message(
+        'Génération du graphe du role {}'.format(role.name)
+    )
+    messageMap = await getMap(role, since)
+    filename = await messageMap.getGraph(min_count)
     await interaction.channel.send(file=discord.File(filename))
 
+    
+@client.tree.command(name='map')
+@discord.app_commands.describe(role='Le rôle cartographié',
+                               since='Nombre de jour maximum à remonter dans l\'historique',
+                               clear_cache='Ne Pas utiliser le cache')
+async def mapRole(interaction: discord.Interaction,
+                  role: discord.Role,
+                  since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
+                  clear_cache: Optional[bool] = False):
+    await interaction.response.send_message(
+        'Mapping du role {} ({} derniers jours) en cours...'.format(role.name, since)
+    )
+    await getMap(role, since, clear_cache)
+    await interaction.channel.send('Mapping du role {} terminé'.format(role.name))
+
+    
 load_dotenv()
 client.run(os.getenv('DISCORD_TOKEN'))
