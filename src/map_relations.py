@@ -15,7 +15,8 @@ from typing import Optional, Literal
 Colormap = Enum('Colormap', ((c, i) for i, c in enumerate(list(mpl.colormaps))))
 
 class MessageMap(object):
-    def __init__(self, role, client, since=7):
+    def __init__(self, role, client, since=7, channel=None):
+        self.channel = channel
         self.client = client
         self.createdAt = datetime.datetime.now()
         self.since = self.createdAt - datetime.timedelta(days=since)
@@ -77,8 +78,11 @@ class MessageMap(object):
             graph,
             pos,
             connectionstyle=['arc3,rad=0.15', 'arc3,rad=0.30'],
-            edge_cmap=mpl.colormaps['seismic'],
-            edge_color=[edge[2]['sum'] for edge in graph.edges(data=True)],
+            edge_cmap=mpl.colormaps['cool'],
+            edge_color=[
+                edge[2]['sum'] / edge[2]['count'] if edge[2]['count'] != 0 else 0
+                for edge in graph.edges(data=True)
+            ],
             node_size=5000,
             edge_vmax=lmax,
             edge_vmin=-lmax,
@@ -92,12 +96,29 @@ class MessageMap(object):
         Path('var/maps').mkdir(parents=True, exist_ok=True)        
         filename = 'var/maps/{}'.format(filename)
         plt.savefig(filename)
-        return filename  
+        return filename
+
+    def sum(self, m):
+        return m['sum']
+
+    def count(self, m):
+        return m['count']
+
+    def mean(self, m):
+        if m['count'] == 0:
+            return 0
+        return m['sum'] / m['count']
+
+    def logsum(self, m):
+        return math.log(m['sum'])
+
+    def logcount(self, m):
+        return math.log(m['count'])
 
     async def renderMatrix(self, filename, metric, cmap):
         labels = [entry['member'].display_name[:10] for entry in self.mmap.values()]
         data = [
-            [(m['sum'] / m['count'] if m['count'] else 0) if metric == 'mean' else m[metric] for m in entry['messages'].values()]
+            [self[metric](m) for m in entry['messages'].values()]
             for entry in self.mmap.values()
         ]
         if metric == 'count':
@@ -147,12 +168,13 @@ class MessageMap(object):
                 yield member
 
     def scoreMessage(self, message):
-        score = nlp(message.content)
-        if score[0]['label'] == 'POSITIVE':
-            return score[0]['score']
-        return -score[0]['score']
+        scores = {s['label']: s['score'] for s in nlp(message.content, return_all_scores=True)[0]}
+        return scores['POSITIVE'] - scores['NEGATIVE']
 
     async def map(self):
+        if self.channel:
+            await self.mapChannel(channel)
+            return
         for channel in self.guild.text_channels:
             try:
                 await self.mapChannel(channel)
@@ -164,7 +186,8 @@ class MessageMap(object):
         previous = None
         async for message in channel.history(after=self.since, limit=None):
             await self.mapMessage(message, previous)
-            previous = message
+            if previous.author != message.author:
+                previous = message
 
     async def mapMessage(self, message, previous):
         author = message.author
@@ -210,10 +233,10 @@ client = MyClient(intents=intents)
 
 maps = {}
 
-async def getMap(role, since, clear_cache=False):
-    key = '{}@{}'.format(role, since)
+async def getMap(role, since, channel, clear_cache=False):
+    key = '{}@{}@{}'.format(role.id, since, channel.id if channel else '*')
     if key not in maps or clear_cache:
-        maps[key] = MessageMap(role, client, since)
+        maps[key] = MessageMap(role, client, since, channel)
     return await maps[key].resolve()
 
 def isMapCached(role, since):
@@ -223,12 +246,14 @@ def isMapCached(role, since):
 @client.tree.command(name='matrix')
 @discord.app_commands.describe(role='Le rôle cartographié',
                                since='Nombre de jour maximum à remonter dans l\'historique',
+                               channel='Canal spécifique',
                                metric='Valeur à mesurer',
                                cmap='Échelle de couleurs')
 async def matrix(interaction: discord.Interaction,
                  role: discord.Role,
                  since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
-                 metric: Optional[Literal['sum', 'count', 'mean']] = 'sum',
+                 metric: Optional[Literal['sum', 'count', 'mean', 'logsum', 'logcount']] = 'sum',
+                 channel: Optional[discord.TextChannel] = None,
                  cmap: Optional[str] = None):
     if cmap is not None:
         if cmap not in (c.name for c in Colormap):
@@ -238,21 +263,23 @@ async def matrix(interaction: discord.Interaction,
     await interaction.response.send_message(
         'Génération de la matrice {} du role {}'.format(metric, role.name)
     )
-    messageMap = await getMap(role, since)
+    messageMap = await getMap(role, since, channel)
     filename = await messageMap.getMatrix(metric, cmap)
     await interaction.channel.send(file=discord.File(filename))
 @client.tree.command(name='graph')
 @discord.app_commands.describe(role='Le rôle cartographié',
                                since='Nombre de jour maximum à remonter dans l\'historique',
+                               channel='Canal spécifique',
                                min_count='Nombre minimal de messages pour afficher le lien')
 async def graph(interaction: discord.Interaction,
-                 role: discord.Role,
-                 since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
-                 min_count: Optional[int] = 10):
+                role: discord.Role,
+                since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
+                channel: Optional[discord.TextChannel] = None,
+                min_count: Optional[int] = 10):
     await interaction.response.send_message(
         'Génération du graphe du role {}'.format(role.name)
     )
-    messageMap = await getMap(role, since)
+    messageMap = await getMap(role, since, channel)
     filename = await messageMap.getGraph(min_count)
     await interaction.channel.send(file=discord.File(filename))
 
@@ -260,15 +287,17 @@ async def graph(interaction: discord.Interaction,
 @client.tree.command(name='map')
 @discord.app_commands.describe(role='Le rôle cartographié',
                                since='Nombre de jour maximum à remonter dans l\'historique',
+                               channel='Canal spécifique',
                                clear_cache='Ne Pas utiliser le cache')
 async def mapRole(interaction: discord.Interaction,
                   role: discord.Role,
                   since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
+                  channel: Optional[discord.TextChannel] = None,
                   clear_cache: Optional[bool] = False):
     await interaction.response.send_message(
         'Mapping du role {} ({} derniers jours) en cours...'.format(role.name, since)
     )
-    await getMap(role, since, clear_cache)
+    await getMap(role, since, channel, clear_cache)
     await interaction.channel.send('Mapping du role {} terminé'.format(role.name))
 
     
