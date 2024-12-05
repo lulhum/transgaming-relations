@@ -14,6 +14,11 @@ from typing import Optional, Literal
 
 Colormap = Enum('Colormap', ((c, i) for i, c in enumerate(list(mpl.colormaps))))
 
+async def periodic(period, cb):
+    while True:
+        await cb()
+        await asyncio.sleep(period)
+
 class MessageMap(object):
     def __init__(self, role, client, since=7, channel=None):
         self.channel = channel
@@ -169,7 +174,10 @@ class MessageMap(object):
                 yield member
 
     def scoreMessage(self, message):
-        return nlp.score(message.content)
+        try:
+            return nlp.score(message.content)
+        except:
+            return 0
 
     async def map(self):
         if self.channel is not None:
@@ -288,7 +296,13 @@ async def graph(interaction: discord.Interaction,
     filename = await messageMap.getGraph(min_count)
     await interaction.channel.send(file=discord.File(filename))
 
-    
+def send_message_cb(channel, msg):
+    async def cb():
+        await channel.send(msg)
+    return cb
+
+cnt = 0
+
 @client.tree.command(name='map')
 @discord.app_commands.describe(role='Le rôle cartographié',
                                since='Nombre de jour maximum à remonter dans l\'historique',
@@ -298,14 +312,21 @@ async def mapRole(interaction: discord.Interaction,
                   role: discord.Role,
                   since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
                   channel: Optional[discord.TextChannel] = None,
-                  clear_cache: Optional[bool] = False):
+                  clear_cache: Optional[bool] = False):
+    cnt += 1
     if channel is None:
-        msg = 'Mapping du role {} ({} derniers jours) en cours...'.format(role.name, since)
+        msg = 'Mapping #{} du role {} ({} derniers jours) en cours...'.format(cnt, role.name, since)
     else:
-        msg = 'Mapping du role {} sur #{} ({} derniers jours) en cours...'.format(role.name, channel.name, since)
+        msg = 'Mapping #{} du role {} sur #{} ({} derniers jours) en cours...'.format(
+            cnt, role.name, channel.name, since)
     await interaction.response.send_message(msg)
+    task = asyncio.create_task(periodic(600, send_message_cb(
+        interaction.channel,
+        'Mapping #{} du role {} en cours...'.format(cnt, role.name)
+    )))
     await getMap(role, since, channel, clear_cache)
-    await interaction.channel.send('Mapping du role {} terminé'.format(role.name))
+    task.cancel()
+    await interaction.channel.send('Mapping #{} du role {} terminé'.format(cnt, role.name))
 
     
 load_dotenv()
