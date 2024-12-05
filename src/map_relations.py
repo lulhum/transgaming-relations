@@ -52,7 +52,6 @@ class MessageMap(object):
     async def renderGraph(self, filename, min_count):
         graph = nx.DiGraph()
         mmax = 0
-        lmax = 0
         for mid, entry in self.mmap.items():
             label = entry['member'].display_name
             weight = sum(m['count'] for m in entry['messages'].values())
@@ -60,9 +59,7 @@ class MessageMap(object):
                 mmax = abs(weight)
             graph.add_node(mid, label=label, weight=weight)
             for tid, m in entry['messages'].items():
-                if m['count'] > min_count:
-                    if abs(m['sum']) > lmax:
-                        lmax = abs(m['sum'])
+                if m['count'] >= min_count:
                     graph.add_edge(mid, tid, count=m['count'], sum=m['sum'])
         plt.figure(figsize=(len(self.mmap) * 2, len(self.mmap) * 2))
         pos = nx.circular_layout(graph)
@@ -79,14 +76,11 @@ class MessageMap(object):
             graph,
             pos,
             connectionstyle=['arc3,rad=0.15', 'arc3,rad=0.30'],
-            edge_cmap=mpl.colormaps['cool'],
-            edge_color=[
-                edge[2]['sum'] / edge[2]['count'] if edge[2]['count'] != 0 else 0
-                for edge in graph.edges(data=True)
-            ],
+            edge_cmap=mpl.colormaps['coolwarm'],
+            edge_color=[self.mean(edge[2]) for edge in graph.edges(data=True)],
             node_size=5000,
-            edge_vmax=lmax,
-            edge_vmin=-lmax,
+            edge_vmax=1,
+            edge_vmin=-1,
             width=[math.log2(max(1, edge[2]['count'])) for edge in graph.edges(data=True)]
         )
         nx.draw_networkx_labels(
@@ -304,7 +298,7 @@ async def mapRole(interaction: discord.Interaction,
                   role: discord.Role,
                   since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
                   channel: Optional[discord.TextChannel] = None,
-                  clear_cache: Optional[bool] = False):
+                  clear_cache: Optional[bool] = False):
     if channel is None:
         msg = 'Mapping du role {} ({} derniers jours) en cours...'.format(role.name, since)
     else:
