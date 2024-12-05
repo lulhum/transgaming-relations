@@ -15,11 +15,12 @@ from typing import Optional, Literal
 Colormap = Enum('Colormap', ((c, i) for i, c in enumerate(list(mpl.colormaps))))
 
 class MessageMap(object):
-    def __init__(self, role, since=7):
+    def __init__(self, role, client, since=7):
+        self.client = client
         self.createdAt = datetime.datetime.now()
         self.since = self.createdAt - datetime.timedelta(days=since)
         self.role = role
-        self.members = set(role.members)
+        self.members = set(m for m in role.members if m.id != self.client.user.id)
         self.guild = role.guild
         self.mmap = {m.id: {
             'member': m,
@@ -96,7 +97,7 @@ class MessageMap(object):
     async def renderMatrix(self, filename, metric, cmap):
         labels = [entry['member'].display_name[:10] for entry in self.mmap.values()]
         data = [
-            [m['sum'] / m['count'] if metric == 'mean' else m[metric] for m in entry['messages'].values()]
+            [(m['sum'] / m['count'] if m['count'] else 0) if metric == 'mean' else m[metric] for m in entry['messages'].values()]
             for entry in self.mmap.values()
         ]
         if metric == 'count':
@@ -107,8 +108,12 @@ class MessageMap(object):
         else:
             if cmap is None:
                 cmap = Colormap.seismic
-            vmax = max(max(abs(d) for d in row) for row in data)
-            vmin = -vmax
+            if metric == 'mean':
+                vmax = 1
+                vmin = 0
+            else:
+                vmax = max(max(abs(d) for d in row) for row in data)
+                vmin = -vmax
         fig = plt.figure()
         plt.subplots_adjust(top=0.8, left=0.15)
         ax = fig.add_subplot(111)
@@ -149,9 +154,13 @@ class MessageMap(object):
 
     async def map(self):
         for channel in self.guild.text_channels:
-            await self.mapChannel(channel)
+            try:
+                await self.mapChannel(channel)
+            except:
+                pass
 
     async def mapChannel(self, channel):
+        print('Mapping Channel {}'.format(channel.name))
         previous = None
         async for message in channel.history(after=self.since, limit=None):
             await self.mapMessage(message, previous)
@@ -204,7 +213,7 @@ maps = {}
 async def getMap(role, since, clear_cache=False):
     key = '{}@{}'.format(role, since)
     if key not in maps or clear_cache:
-        maps[key] = MessageMap(role, since)
+        maps[key] = MessageMap(role, client, since)
     return await maps[key].resolve()
 
 def isMapCached(role, since):
