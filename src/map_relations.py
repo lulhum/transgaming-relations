@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 from pathlib import Path
 from dotenv import load_dotenv
-from nlp import nlp
+import nlp
 import math
 from enum import Enum
 from typing import Optional, Literal
@@ -21,7 +21,8 @@ class MessageMap(object):
         self.createdAt = datetime.datetime.now()
         self.since = self.createdAt - datetime.timedelta(days=since)
         self.role = role
-        self.members = set(m for m in role.members if m.id != self.client.user.id)
+        self.members = [m for m in role.members if m.id != self.client.user.id]
+        self.mids = set(m.id for m in self.members)
         self.guild = role.guild
         self.mmap = {m.id: {
             'member': m,
@@ -110,18 +111,24 @@ class MessageMap(object):
         return m['sum'] / m['count']
 
     def logsum(self, m):
-        return math.log(m['sum'])
+        if m['sum'] == 0:
+            return 0
+        if m['sum'] > 0:
+            return math.log(m['sum'] + 1)
+        return -math.log(abs(m['sum']) + 1)
 
     def logcount(self, m):
-        return math.log(m['count'])
+        if m['count'] == 0:
+            return 0
+        return math.log(m['count'] + 1)
 
     async def renderMatrix(self, filename, metric, cmap):
         labels = [entry['member'].display_name[:10] for entry in self.mmap.values()]
         data = [
-            [self[metric](m) for m in entry['messages'].values()]
+            [getattr(self, metric)(m) for m in entry['messages'].values()]
             for entry in self.mmap.values()
         ]
-        if metric == 'count':
+        if metric == 'count' or metric == 'logcount':
             if cmap is None:
                 cmap = Colormap.YlGnBu
             vmax = max(max(row) for row in data)
@@ -131,7 +138,7 @@ class MessageMap(object):
                 cmap = Colormap.seismic
             if metric == 'mean':
                 vmax = 1
-                vmin = 0
+                vmin = -1
             else:
                 vmax = max(max(abs(d) for d in row) for row in data)
                 vmin = -vmax
@@ -154,26 +161,25 @@ class MessageMap(object):
     async def getTargets(self, message, previous):
         if message.reference is not None:
             if message.reference.cached_message is not None:
-                if message.reference.cached_message.author in self.members:
+                if message.reference.cached_message.author.id in self.mids:
                     yield message.reference.cached_message.author
             elif message.reference.message_id is not None:
                 channel = self.guild.get_channel(message.reference.channel_id)
                 msg = await channel.fetch_message(message.reference.message_id)
-                if msg.author in self.members:
+                if msg.author.id in self.mids:
                     yield msg.author
-        elif previous and previous.author in self.members and previous.author != message.author:
+        elif previous and previous.author.id in self.mids and previous.author.id != message.author.id:
             yield previous.author            
         for member in message.mentions:
-            if member in self.members:
+            if member.id in self.mids:
                 yield member
 
     def scoreMessage(self, message):
-        scores = {s['label']: s['score'] for s in nlp(message.content, return_all_scores=True)[0]}
-        return scores['POSITIVE'] - scores['NEGATIVE']
+        return nlp.score(message.content)
 
     async def map(self):
-        if self.channel:
-            await self.mapChannel(channel)
+        if self.channel is not None:
+            await self.mapChannel(self.channel)
             return
         for channel in self.guild.text_channels:
             try:
@@ -186,17 +192,17 @@ class MessageMap(object):
         previous = None
         async for message in channel.history(after=self.since, limit=None):
             await self.mapMessage(message, previous)
-            if previous.author != message.author:
+            if previous is None or previous.author != message.author:
                 previous = message
 
     async def mapMessage(self, message, previous):
         author = message.author
-        if author not in self.members:
+        if author.id not in self.mids:
             return
         score = None
         targets = set()
         async for target in self.getTargets(message, previous):
-            if target == author:
+            if target.id == author.id:
                 continue
             if target.id in targets:
                 continue
@@ -204,7 +210,12 @@ class MessageMap(object):
             if score is None:
                 score = self.scoreMessage(message)
             self.addToMap(author, target, score)
-            print('Message from {} to {} ({})'.format(author.name, target.name, score))
+            print('Message from {} to {} ({}) - {}'.format(
+                author.name,
+                target.name,
+                score,
+                message.content[:80]
+            ))
 
 class MyClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
@@ -294,9 +305,11 @@ async def mapRole(interaction: discord.Interaction,
                   since: Optional[discord.app_commands.Range[int, 1, 360]] = 7,
                   channel: Optional[discord.TextChannel] = None,
                   clear_cache: Optional[bool] = False):
-    await interaction.response.send_message(
-        'Mapping du role {} ({} derniers jours) en cours...'.format(role.name, since)
-    )
+    if channel is None:
+        msg = 'Mapping du role {} ({} derniers jours) en cours...'.format(role.name, since)
+    else:
+        msg = 'Mapping du role {} sur #{} ({} derniers jours) en cours...'.format(role.name, channel.name, since)
+    await interaction.response.send_message(msg)
     await getMap(role, since, channel, clear_cache)
     await interaction.channel.send('Mapping du role {} terminé'.format(role.name))
 
